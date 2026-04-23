@@ -910,15 +910,18 @@ async function processZipInBrowser(file) {
 
   appendLog('Reading ZIP locally...', 'info');
   const zip = await JSZip.loadAsync(file);
-  const patientMap = collectPatientFiles(zip);
-  const patients = Array.from(patientMap.entries()).sort((a, b) => a[0].localeCompare(b[0]));
+  const rootFolder = findRootFolder(zip);
+  const patients = collectPatientFolders(zip, rootFolder);
 
   if (!patients.length) {
     return {
       ok: false,
-      error: 'No patient PDFs found. Put PDF files inside patient folders and try again.'
+      error: 'No patient folders found. Make sure the ZIP contains patient folders with PDFs inside.'
     };
   }
+
+  appendLog(`Using root folder: ${rootFolder || '(zip root)'}`, 'info');
+  appendLog(`Found ${patients.length} patient folder(s)`, 'info');
 
   const flatZip = new JSZip();
   const structZip = new JSZip();
@@ -926,7 +929,7 @@ async function processZipInBrowser(file) {
   const logs = [];
 
   for (let i = 0; i < patients.length; i++) {
-    const [patient, entries] = patients[i];
+    const { patient, entries } = patients[i];
     logs.push({ msg: `Merging ${patient} (${entries.length} PDF${entries.length === 1 ? '' : 's'})`, level: 'info' });
     appendLog(`Merging ${patient}...`, 'info');
 
@@ -968,33 +971,58 @@ async function processZipInBrowser(file) {
   };
 }
 
-function collectPatientFiles(zip) {
+function findRootFolder(zip) {
+  const topDirs = new Set();
+
+  Object.values(zip.files).forEach(entry => {
+    const path = entry.name.replace(/\\/g, '/');
+    const parts = path.split('/').filter(Boolean);
+    if (!parts.length) return;
+
+    const top = parts[0];
+    if (!top || top.startsWith('_') || top.startsWith('.')) return;
+    topDirs.add(top);
+  });
+
+  if (topDirs.size === 1) {
+    return Array.from(topDirs)[0];
+  }
+
+  return '';
+}
+
+function collectPatientFolders(zip, rootFolder) {
   const patientMap = new Map();
+  const rootPrefix = rootFolder ? `${rootFolder}/` : '';
 
   Object.values(zip.files).forEach(entry => {
     if (entry.dir) return;
 
     const path = entry.name.replace(/\\/g, '/');
     const lower = path.toLowerCase();
-    const parts = path.split('/').filter(Boolean);
 
     if (lower.includes('__macosx') || lower.endsWith('.ds_store')) return;
-    if (parts.some(part => part.startsWith('._'))) return;
     if (!lower.endsWith('.pdf')) return;
+
+    const relativePath = rootPrefix && path.startsWith(rootPrefix) ? path.slice(rootPrefix.length) : path;
+    const parts = relativePath.split('/').filter(Boolean);
+
+    if (parts.some(part => part.startsWith('__') || part.startsWith('.'))) return;
     if (parts.length < 2) return;
 
     const patient = parts[0].trim();
-    if (!patient) return;
+    if (!patient || patient.startsWith('_') || patient.startsWith('.')) return;
 
     if (!patientMap.has(patient)) patientMap.set(patient, []);
     patientMap.get(patient).push(entry);
   });
 
-  patientMap.forEach(entries => {
-    entries.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }));
-  });
-
-  return patientMap;
+  return Array.from(patientMap.entries())
+    .sort((a, b) => a[0].localeCompare(b[0], undefined, { numeric: true, sensitivity: 'base' }))
+    .map(([patient, entries]) => ({
+      patient,
+      entries: entries.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }))
+    }));
 }
 
 async function mergePatientEntries(patient, entries) {
