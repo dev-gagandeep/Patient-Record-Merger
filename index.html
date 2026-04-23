@@ -4,7 +4,10 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Patient Record Merger — Medical Document Pipeline</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230a2240'/%3E%3Cpath d='M20 18h16l8 8v20a4 4 0 0 1-4 4H20a4 4 0 0 1-4-4V22a4 4 0 0 1 4-4Z' fill='%23fff'/%3E%3Cpath d='M36 18v8h8' fill='none' stroke='%230a2240' stroke-width='4' stroke-linejoin='round'/%3E%3Cpath d='M24 34h16M24 40h16' stroke='%230a2240' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
 <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@600;700&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js"></script>
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -793,6 +796,7 @@ footer a { color: rgba(255,255,255,0.6); text-decoration: none; }
 // ── State ──────────────────────────────────────────────────
 let selectedFile = null;
 let logCount = 0;
+let downloadUrls = [];
 
 // ── Elements ───────────────────────────────────────────────
 const fileInput      = document.getElementById('fileInput');
@@ -850,10 +854,9 @@ async function startProcessing() {
   formData.append('file', selectedFile);
 
   try {
-    // Detect API base (works both locally via Flask and on Vercel)
-    const apiBase = window.location.hostname === 'localhost' ? '' : '';
-    const res  = await fetch(`${apiBase}/api/process`, { method: 'POST', body: formData });
-    const data = await res.json();
+    // Prefer the existing server route. If it is missing on Vercel, fall back
+    // to the same patient-by-patient merge logic in the browser.
+    const data = await processWithServerOrFallback(formData);
 
     fakeProgress(30, 100, 800);
     await sleep(900);
@@ -881,6 +884,159 @@ async function startProcessing() {
     btnSpinner.classList.remove('show');
     processBtn.disabled = false;
   }
+}
+
+async function processWithServerOrFallback(formData) {
+  try {
+    const res = await fetch('/api/process', { method: 'POST', body: formData });
+    const contentType = res.headers.get('content-type') || '';
+
+    if (res.ok && contentType.includes('application/json')) {
+      return await res.json();
+    }
+
+    appendLog('Server pipeline unavailable. Falling back to in-browser processing...', 'warn');
+  } catch (err) {
+    appendLog('Server pipeline unavailable. Falling back to in-browser processing...', 'warn');
+  }
+
+  return await processZipInBrowser(selectedFile);
+}
+
+async function processZipInBrowser(file) {
+  if (!window.JSZip || !window.PDFLib) {
+    throw new Error('PDF processing libraries failed to load.');
+  }
+
+  appendLog('Reading ZIP locally...', 'info');
+  const zip = await JSZip.loadAsync(file);
+  const patientMap = collectPatientFiles(zip);
+  const patients = Array.from(patientMap.entries()).sort((a, b) => a[0].localeCompare(b[0]));
+
+  if (!patients.length) {
+    return {
+      ok: false,
+      error: 'No patient PDFs found. Put PDF files inside patient folders and try again.'
+    };
+  }
+
+  const flatZip = new JSZip();
+  const structZip = new JSZip();
+  const results = [];
+  const logs = [];
+
+  for (let i = 0; i < patients.length; i++) {
+    const [patient, entries] = patients[i];
+    logs.push({ msg: `Merging ${patient} (${entries.length} PDF${entries.length === 1 ? '' : 's'})`, level: 'info' });
+    appendLog(`Merging ${patient}...`, 'info');
+
+    const result = await mergePatientEntries(patient, entries);
+    results.push(result);
+
+    if (result.status === 'success') {
+      flatZip.file(result.filename, result.bytes);
+      structZip.folder(patient).file(result.filename, result.bytes);
+      logs.push({ msg: `✓ ${patient} merged successfully`, level: 'info' });
+    } else if (result.status === 'skipped') {
+      logs.push({ msg: `${patient} skipped: no readable PDFs found`, level: 'warn' });
+    } else {
+      logs.push({ msg: `${patient} failed: ${result.error || 'unknown error'}`, level: 'error' });
+    }
+  }
+
+  const successCount = results.filter(r => r.status === 'success').length;
+  if (!successCount) {
+    return {
+      ok: false,
+      error: 'No patients could be merged. Check whether the PDFs are valid and not encrypted.',
+      logs
+    };
+  }
+
+  appendLog('Creating output ZIP files...', 'info');
+  const [flatBuffer, structBuffer] = await Promise.all([
+    flatZip.generateAsync({ type: 'uint8array' }),
+    structZip.generateAsync({ type: 'uint8array' })
+  ]);
+
+  return {
+    ok: true,
+    logs,
+    results: results.map(({ bytes, filename, ...rest }) => rest),
+    flat_zip: uint8ToBase64(flatBuffer),
+    struct_zip: uint8ToBase64(structBuffer)
+  };
+}
+
+function collectPatientFiles(zip) {
+  const patientMap = new Map();
+
+  Object.values(zip.files).forEach(entry => {
+    if (entry.dir) return;
+
+    const path = entry.name.replace(/\\/g, '/');
+    const lower = path.toLowerCase();
+    const parts = path.split('/').filter(Boolean);
+
+    if (lower.includes('__macosx') || lower.endsWith('.ds_store')) return;
+    if (parts.some(part => part.startsWith('._'))) return;
+    if (!lower.endsWith('.pdf')) return;
+    if (parts.length < 2) return;
+
+    const patient = parts[0].trim();
+    if (!patient) return;
+
+    if (!patientMap.has(patient)) patientMap.set(patient, []);
+    patientMap.get(patient).push(entry);
+  });
+
+  patientMap.forEach(entries => {
+    entries.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' }));
+  });
+
+  return patientMap;
+}
+
+async function mergePatientEntries(patient, entries) {
+  const mergedPdf = await PDFLib.PDFDocument.create();
+  let totalPages = 0;
+  let mergedCount = 0;
+
+  for (const entry of entries) {
+    try {
+      const bytes = await entry.async('uint8array');
+      const srcPdf = await PDFLib.PDFDocument.load(bytes, { ignoreEncryption: true });
+      const copiedPages = await mergedPdf.copyPages(srcPdf, srcPdf.getPageIndices());
+      copiedPages.forEach(page => mergedPdf.addPage(page));
+      totalPages += copiedPages.length;
+      mergedCount += 1;
+    } catch (err) {
+      appendLog(`Skipped unreadable PDF for ${patient}: ${entry.name.split('/').pop()}`, 'warn');
+    }
+  }
+
+  if (!mergedCount || !totalPages) {
+    return {
+      patient,
+      pdf_count: entries.length,
+      pages: 0,
+      size_kb: 0,
+      status: 'skipped'
+    };
+  }
+
+  const filename = `${safeName(patient)}_merged.pdf`;
+  const mergedBytes = await mergedPdf.save();
+
+  return {
+    patient,
+    pdf_count: mergedCount,
+    pages: totalPages,
+    size_kb: Math.max(1, Math.round(mergedBytes.length / 1024)),
+    status: 'success',
+    filename,
+    bytes: mergedBytes
+  };
 }
 
 function showResults(data) {
@@ -955,16 +1111,35 @@ function b64ToBlob(b64, type) {
   const bin = atob(b64);
   const arr = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
-  return URL.createObjectURL(new Blob([arr], { type }));
+  const url = URL.createObjectURL(new Blob([arr], { type }));
+  downloadUrls.push(url);
+  return url;
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+function uint8ToBase64(bytes) {
+  let binary = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
+function safeName(s) {
+  return String(s).replace(/[<>:"/\\|?*\u0000-\u001F]/g, '').replace(/\s+/g, '_').slice(0, 120) || 'patient';
+}
 
 function esc(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
-function resetAll() { location.reload(); }
+function resetAll() {
+  downloadUrls.forEach(url => URL.revokeObjectURL(url));
+  downloadUrls = [];
+  location.reload();
+}
 </script>
 </body>
 </html>
