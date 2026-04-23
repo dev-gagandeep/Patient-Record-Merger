@@ -797,6 +797,7 @@ footer a { color: rgba(255,255,255,0.6); text-decoration: none; }
 let selectedFile = null;
 let logCount = 0;
 let downloadUrls = [];
+let progressTimer = null;
 
 // ── Elements ───────────────────────────────────────────────
 const fileInput      = document.getElementById('fileInput');
@@ -847,7 +848,7 @@ async function startProcessing() {
   logSection.classList.add('show');
   logCount = 0;
 
-  fakeProgress(0, 30, 1500);
+  setProgress(5, 'Uploading ZIP...');
   appendLog('Uploading ZIP to pipeline...', 'info');
 
   const formData = new FormData();
@@ -858,7 +859,7 @@ async function startProcessing() {
     // to the same patient-by-patient merge logic in the browser.
     const data = await processWithServerOrFallback(formData);
 
-    fakeProgress(30, 100, 800);
+    setProgress(95, 'Finalizing...');
     await sleep(900);
 
     if (!data.ok) {
@@ -909,6 +910,7 @@ async function processZipInBrowser(file) {
   }
 
   appendLog('Reading ZIP locally...', 'info');
+  setProgress(15, 'Reading ZIP...');
   const zip = await JSZip.loadAsync(file);
   const rootFolder = findRootFolder(zip);
   const patients = collectPatientFolders(zip, rootFolder);
@@ -930,6 +932,8 @@ async function processZipInBrowser(file) {
 
   for (let i = 0; i < patients.length; i++) {
     const { patient, entries } = patients[i];
+    const patientProgress = 30 + Math.round(((i + 1) / patients.length) * 55);
+    setProgress(patientProgress, `Merging ${patient}...`);
     logs.push({ msg: `Merging ${patient} (${entries.length} PDF${entries.length === 1 ? '' : 's'})`, level: 'info' });
     appendLog(`Merging ${patient}...`, 'info');
 
@@ -957,6 +961,7 @@ async function processZipInBrowser(file) {
   }
 
   appendLog('Creating output ZIP files...', 'info');
+  setProgress(92, 'Creating ZIP files...');
   const [flatBuffer, structBuffer] = await Promise.all([
     flatZip.generateAsync({ type: 'uint8array' }),
     structZip.generateAsync({ type: 'uint8array' })
@@ -1123,16 +1128,15 @@ function appendLog(msg, type) {
   logBody.scrollTop = logBody.scrollHeight;
 }
 
-function fakeProgress(from, to, ms) {
-  const step = (to - from) / (ms / 80);
-  let cur = from;
-  const iv = setInterval(() => {
-    cur = Math.min(cur + step, to);
-    progressFill.style.width = cur.toFixed(1) + '%';
-    progressPct.textContent  = Math.round(cur) + '%';
-    progressText.textContent = cur < 100 ? `Processing... ${Math.round(cur)}%` : 'Finalizing...';
-    if (cur >= to) clearInterval(iv);
-  }, 80);
+function setProgress(value, label) {
+  const clamped = Math.max(0, Math.min(100, value));
+  if (progressTimer) {
+    clearTimeout(progressTimer);
+    progressTimer = null;
+  }
+  progressFill.style.width = clamped.toFixed(1) + '%';
+  progressPct.textContent  = Math.round(clamped) + '%';
+  progressText.textContent = label || `Processing... ${Math.round(clamped)}%`;
 }
 
 function b64ToBlob(b64, type) {
@@ -1164,6 +1168,10 @@ function esc(s) {
 }
 
 function resetAll() {
+  if (progressTimer) {
+    clearTimeout(progressTimer);
+    progressTimer = null;
+  }
   downloadUrls.forEach(url => URL.revokeObjectURL(url));
   downloadUrls = [];
   location.reload();
